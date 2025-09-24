@@ -531,6 +531,7 @@ def launch_training_task(
     find_unused_parameters: bool = False,
     args = None,
 ):
+    log_interval = 10  # 默认值
     if args is not None:
         learning_rate = args.learning_rate
         weight_decay = args.weight_decay
@@ -539,6 +540,7 @@ def launch_training_task(
         num_epochs = args.num_epochs
         gradient_accumulation_steps = args.gradient_accumulation_steps
         find_unused_parameters = args.find_unused_parameters
+        log_interval = getattr(args, 'log_interval', 10)
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
@@ -549,8 +551,24 @@ def launch_training_task(
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     
+    total_steps_per_epoch = len(dataloader)
+    global_step = 0
+    
     for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader):
+        if accelerator.is_main_process:
+            print(f"\n=== 开始第 {epoch_id + 1}/{num_epochs} 个 epoch ===")
+            print(f"总步数: {total_steps_per_epoch}, 学习率: {learning_rate}, 梯度累积步数: {gradient_accumulation_steps}")
+        
+        # 只在主进程显示进度条
+        dataloader_with_progress = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch_id + 1}/{num_epochs}",
+            disable=not accelerator.is_main_process,
+            ncols=120,
+            unit="batch"
+        )
+        
+        for step, data in enumerate(dataloader_with_progress):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 if dataset.load_from_cache:
@@ -561,8 +579,26 @@ def launch_training_task(
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
+                
+                global_step += 1
+                
+                # 定期打印详细的训练状态（只在主进程）
+                if accelerator.is_main_process and step % log_interval == 0:
+                    current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else learning_rate
+                    progress_pct = (step + 1) / total_steps_per_epoch * 100
+                    print(f"[训练日志] Epoch {epoch_id + 1}/{num_epochs}, "
+                          f"Step {step + 1}/{total_steps_per_epoch} ({progress_pct:.1f}%), "
+                          f"Global Step: {global_step}, "
+                          f"Loss: {loss.item():.6f}, "
+                          f"LR: {current_lr:.2e}")
+        
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
+            if accelerator.is_main_process:
+                print(f"=== 第 {epoch_id + 1} 个 epoch 完成，模型已保存 ===")
+    
+    if accelerator.is_main_process:
+        print(f"\n=== 训练完成！总共训练了 {global_step} 步 ===")
     model_logger.on_training_end(accelerator, model, save_steps)
 
 
@@ -573,14 +609,30 @@ def launch_data_process_task(
     num_workers: int = 8,
     args = None,
 ):
+    log_interval = 100  # 数据处理任务的日志间隔
     if args is not None:
         num_workers = args.dataset_num_workers
+        log_interval = getattr(args, 'log_interval', 100)
         
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=False, collate_fn=lambda x: x[0], num_workers=num_workers)
     accelerator = Accelerator()
     model, dataloader = accelerator.prepare(model, dataloader)
     
-    for data_id, data in tqdm(enumerate(dataloader)):
+    if accelerator.is_main_process:
+        print(f"\n=== 开始数据处理任务 ===")
+        print(f"总数据量: {len(dataloader)}, 进程数: {accelerator.num_processes}")
+    
+    # 只在主进程显示进度条
+    dataloader_with_progress = tqdm(
+        enumerate(dataloader),
+        desc="数据处理",
+        disable=not accelerator.is_main_process,
+        total=len(dataloader),
+        ncols=120,
+        unit="batch"
+    )
+    
+    for data_id, data in dataloader_with_progress:
         with accelerator.accumulate(model):
             with torch.no_grad():
                 folder = os.path.join(model_logger.output_path, str(accelerator.process_index))
@@ -588,6 +640,15 @@ def launch_data_process_task(
                 save_path = os.path.join(model_logger.output_path, str(accelerator.process_index), f"{data_id}.pth")
                 data = model(data, return_inputs=True)
                 torch.save(data, save_path)
+                
+                # 定期打印处理状态（只在主进程）
+                if accelerator.is_main_process and data_id % log_interval == 0:
+                    progress_pct = (data_id + 1) / len(dataloader) * 100
+                    print(f"[数据处理日志] 进度: {data_id + 1}/{len(dataloader)} ({progress_pct:.1f}%), "
+                          f"进程 {accelerator.process_index} 正在处理...")
+    
+    if accelerator.is_main_process:
+        print(f"=== 数据处理任务完成！ ===")
 
 
 
@@ -690,4 +751,5 @@ def qwen_image_parser():
     parser.add_argument("--processor_path", type=str, default=None, help="Path to the processor. If provided, the processor will be used for image editing.")
     parser.add_argument("--enable_fp8_training", default=False, action="store_true", help="Whether to enable FP8 training. Only available for LoRA training on a single GPU.")
     parser.add_argument("--task", type=str, default="sft", required=False, help="Task type.")
+    parser.add_argument("--log_interval", type=int, default=10, help="Interval for printing detailed training logs (number of steps).")
     return parser
