@@ -7,6 +7,23 @@ import pandas as pd
 from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
+import time
+from typing import Optional, Dict, Any
+
+# 尝试导入日志记录库
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not available. Install with: pip install wandb")
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
+    print("Warning: tensorboard not available. Install with: pip install tensorboard")
 
 
 
@@ -478,22 +495,115 @@ class DiffusionTrainingModule(torch.nn.Module):
 
 
 class ModelLogger:
-    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x):
+    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x, 
+                 use_wandb=False, use_tensorboard=False, project_name="diffsynth-training", 
+                 experiment_name=None, log_config=None):
         self.output_path = output_path
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
         self.state_dict_converter = state_dict_converter
         self.num_steps = 0
+        
+        # 日志记录设置
+        self.use_wandb = use_wandb and WANDB_AVAILABLE
+        self.use_tensorboard = use_tensorboard and TENSORBOARD_AVAILABLE
+        self.wandb_run = None
+        self.tensorboard_writer = None
+        self.start_time = time.time()
+        
+        # 初始化日志记录器
+        if self.use_wandb:
+            self._init_wandb(project_name, experiment_name, log_config)
+        
+        if self.use_tensorboard:
+            self._init_tensorboard()
+    
+    def _init_wandb(self, project_name, experiment_name, log_config):
+        """初始化 wandb"""
+        try:
+            if experiment_name is None:
+                experiment_name = f"diffsynth-{int(time.time())}"
+            
+            self.wandb_run = wandb.init(
+                project=project_name,
+                name=experiment_name,
+                config=log_config or {},
+                dir=self.output_path
+            )
+            print(f"✅ WandB 初始化成功: {project_name}/{experiment_name}")
+        except Exception as e:
+            print(f"❌ WandB 初始化失败: {e}")
+            self.use_wandb = False
+    
+    def _init_tensorboard(self):
+        """初始化 tensorboard"""
+        try:
+            log_dir = os.path.join(self.output_path, "tensorboard_logs")
+            os.makedirs(log_dir, exist_ok=True)
+            self.tensorboard_writer = SummaryWriter(log_dir)
+            print(f"✅ TensorBoard 初始化成功: {log_dir}")
+        except Exception as e:
+            print(f"❌ TensorBoard 初始化失败: {e}")
+            self.use_tensorboard = False
+    
+    def log_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None):
+        """记录指标到各种日志系统"""
+        if step is None:
+            step = self.num_steps
+        
+        # 记录到 wandb
+        if self.use_wandb and self.wandb_run:
+            try:
+                self.wandb_run.log(metrics, step=step)
+            except Exception as e:
+                print(f"WandB 日志记录失败: {e}")
+        
+        # 记录到 tensorboard
+        if self.use_tensorboard and self.tensorboard_writer:
+            try:
+                for key, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        self.tensorboard_writer.add_scalar(key, value, step)
+                self.tensorboard_writer.flush()
+            except Exception as e:
+                print(f"TensorBoard 日志记录失败: {e}")
+    
+    def log_loss(self, loss_value: float, learning_rate: float = None, epoch: int = None):
+        """专门记录 loss 和相关训练指标"""
+        metrics = {
+            "train/loss": loss_value,
+            "train/step": self.num_steps,
+            "train/time_elapsed": time.time() - self.start_time
+        }
+        
+        if learning_rate is not None:
+            metrics["train/learning_rate"] = learning_rate
+        
+        if epoch is not None:
+            metrics["train/epoch"] = epoch
+        
+        self.log_metrics(metrics)
 
-
-    def on_step_end(self, accelerator, model, save_steps=None):
+    def on_step_end(self, accelerator, model, save_steps=None, loss=None, learning_rate=None, epoch=None):
         self.num_steps += 1
+        
+        # 记录 loss（只在主进程）
+        if accelerator.is_main_process and loss is not None:
+            self.log_loss(loss, learning_rate, epoch)
+        
+        # 保存模型检查点
         if save_steps is not None and self.num_steps % save_steps == 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
-
 
     def on_epoch_end(self, accelerator, model, epoch_id):
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
+            # 记录 epoch 完成
+            self.log_metrics({
+                "train/epoch_completed": epoch_id + 1,
+                "train/total_steps": self.num_steps
+            })
+            
+            # 保存模型
             state_dict = accelerator.get_state_dict(model)
             state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
             state_dict = self.state_dict_converter(state_dict)
@@ -501,11 +611,25 @@ class ModelLogger:
             path = os.path.join(self.output_path, f"epoch-{epoch_id}.safetensors")
             accelerator.save(state_dict, path, safe_serialization=True)
 
-
     def on_training_end(self, accelerator, model, save_steps=None):
         if save_steps is not None and self.num_steps % save_steps != 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
-
+        
+        # 记录训练完成
+        if accelerator.is_main_process:
+            total_time = time.time() - self.start_time
+            self.log_metrics({
+                "train/training_completed": 1,
+                "train/total_training_time": total_time,
+                "train/final_step": self.num_steps
+            })
+            
+            # 关闭日志记录器
+            if self.use_tensorboard and self.tensorboard_writer:
+                self.tensorboard_writer.close()
+            
+            if self.use_wandb and self.wandb_run:
+                self.wandb_run.finish()
 
     def save_model(self, accelerator, model, file_name):
         accelerator.wait_for_everyone()
@@ -516,6 +640,12 @@ class ModelLogger:
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, file_name)
             accelerator.save(state_dict, path, safe_serialization=True)
+            
+            # 记录模型保存
+            self.log_metrics({
+                "train/model_saved": self.num_steps,
+                "train/checkpoint_path": path
+            })
 
 
 def launch_training_task(
@@ -525,6 +655,7 @@ def launch_training_task(
     learning_rate: float = 1e-5,
     weight_decay: float = 1e-2,
     num_workers: int = 8,
+    batch_size: int = 1,
     save_steps: int = None,
     num_epochs: int = 1,
     gradient_accumulation_steps: int = 1,
@@ -536,6 +667,7 @@ def launch_training_task(
         learning_rate = args.learning_rate
         weight_decay = args.weight_decay
         num_workers = args.dataset_num_workers
+        batch_size = getattr(args, 'batch_size', 1)
         save_steps = args.save_steps
         num_epochs = args.num_epochs
         gradient_accumulation_steps = args.gradient_accumulation_steps
@@ -544,7 +676,59 @@ def launch_training_task(
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    # 智能 collate_fn 处理多分辨率图像批处理
+    def collate_fn(batch):
+        if batch_size == 1:
+            return batch[0]  # 保持原有行为
+        
+        # 过滤掉 None 样本
+        valid_samples = [sample for sample in batch if sample is not None]
+        if not valid_samples:
+            return batch[0]
+        
+        # 检查是否启用了动态分辨率
+        if hasattr(dataset, 'dynamic_resolution') and dataset.dynamic_resolution:
+            # 动态分辨率模式：按分辨率分组，只处理同一分辨率的样本
+            return collate_dynamic_resolution_batch(valid_samples)
+        else:
+            # 固定分辨率模式：所有图像应该有相同尺寸，可以正常批处理
+            return valid_samples[0]  # 目前仍返回单个样本，避免潜在问题
+    
+    def collate_dynamic_resolution_batch(samples):
+        """
+        处理动态分辨率的批次数据
+        策略：选择最常见的分辨率，或者降级到单样本处理
+        """
+        if len(samples) == 1:
+            return samples[0]
+        
+        # 获取每个样本的图像尺寸
+        sample_sizes = []
+        for sample in samples:
+            if 'image' in sample and hasattr(sample['image'], 'size'):
+                sample_sizes.append(sample['image'].size)
+            else:
+                # 如果无法获取尺寸，降级到单样本处理
+                return samples[0]
+        
+        # 统计分辨率出现频次
+        from collections import Counter
+        size_counts = Counter(sample_sizes)
+        
+        # 如果所有样本分辨率相同，可以批处理
+        if len(size_counts) == 1:
+            # 所有样本分辨率相同，但目前的训练循环还不支持真正的批处理
+            # 暂时返回第一个样本，避免下游代码出错
+            return samples[0]
+        else:
+            # 分辨率不同，选择最常见的分辨率的第一个样本
+            most_common_size = size_counts.most_common(1)[0][0]
+            for sample in samples:
+                if hasattr(sample.get('image'), 'size') and sample['image'].size == most_common_size:
+                    return sample
+            return samples[0]
+    
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=num_workers)
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
@@ -577,14 +761,23 @@ def launch_training_task(
                     loss = model(data)
                 accelerator.backward(loss)
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
+                
+                # 获取当前学习率
+                current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else learning_rate
+                
+                # 记录到日志系统
+                model_logger.on_step_end(
+                    accelerator, model, save_steps, 
+                    loss=loss.item(), 
+                    learning_rate=current_lr,
+                    epoch=epoch_id
+                )
                 scheduler.step()
                 
                 global_step += 1
                 
                 # 定期打印详细的训练状态（只在主进程）
                 if accelerator.is_main_process and step % log_interval == 0:
-                    current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else learning_rate
                     progress_pct = (step + 1) / total_steps_per_epoch * 100
                     print(f"[训练日志] Epoch {epoch_id + 1}/{num_epochs}, "
                           f"Step {step + 1}/{total_steps_per_epoch} ({progress_pct:.1f}%), "
@@ -681,6 +874,7 @@ def wan_parser():
     parser.add_argument("--find_unused_parameters", default=False, action="store_true", help="Whether to find unused parameters in DDP.")
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for training. Increase this to utilize more GPU memory and speed up training.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     return parser
 
@@ -752,4 +946,12 @@ def qwen_image_parser():
     parser.add_argument("--enable_fp8_training", default=False, action="store_true", help="Whether to enable FP8 training. Only available for LoRA training on a single GPU.")
     parser.add_argument("--task", type=str, default="sft", required=False, help="Task type.")
     parser.add_argument("--log_interval", type=int, default=10, help="Interval for printing detailed training logs (number of steps).")
+    
+    # 日志记录相关参数
+    parser.add_argument("--use_wandb", default=False, action="store_true", help="Whether to use Weights & Biases for logging.")
+    parser.add_argument("--use_tensorboard", default=False, action="store_true", help="Whether to use TensorBoard for logging.")
+    parser.add_argument("--wandb_project", type=str, default="diffsynth-qwen-image", help="WandB project name.")
+    parser.add_argument("--wandb_experiment", type=str, default=None, help="WandB experiment name. If None, auto-generated.")
+    parser.add_argument("--log_config", type=str, default=None, help="Path to JSON file containing additional logging configuration.")
+    
     return parser

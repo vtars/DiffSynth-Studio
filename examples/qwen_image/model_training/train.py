@@ -138,7 +138,22 @@ if __name__ == "__main__":
         enable_fp8_training=args.enable_fp8_training,
         task=args.task,
     )
-    model_logger = ModelLogger(args.output_path, remove_prefix_in_ckpt=args.remove_prefix_in_ckpt)
+    # 准备日志配置
+    log_config = None
+    if args.log_config and os.path.exists(args.log_config):
+        with open(args.log_config, 'r') as f:
+            log_config = json.load(f)
+    
+    # 创建增强的 ModelLogger
+    model_logger = ModelLogger(
+        output_path=args.output_path, 
+        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        use_wandb=args.use_wandb,
+        use_tensorboard=args.use_tensorboard,
+        project_name=args.wandb_project,
+        experiment_name=args.wandb_experiment,
+        log_config=log_config
+    )
     launcher_map = {
         "sft": launch_training_task,
         "data_process": launch_data_process_task,
