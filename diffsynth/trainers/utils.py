@@ -503,8 +503,8 @@ class ModelLogger:
         self.state_dict_converter = state_dict_converter
         self.num_steps = 0
         
-        # 只在主进程中启用日志记录
-        self.is_main_process = accelerator is None or accelerator.is_main_process
+        # 智能判断是否为主进程
+        self.is_main_process = self._determine_main_process(accelerator)
         
         # 日志记录设置（只在主进程中启用）
         self.use_wandb = use_wandb and WANDB_AVAILABLE and self.is_main_process
@@ -522,6 +522,31 @@ class ModelLogger:
         
         if self.use_tensorboard:
             self._init_tensorboard()
+    
+    def _determine_main_process(self, accelerator):
+        """智能判断是否为主进程"""
+        if accelerator is not None:
+            return accelerator.is_main_process
+        
+        # 当 accelerator 为 None 时，检测分布式环境
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                # 在分布式环境中，只有 rank 0 是主进程
+                return dist.get_rank() == 0
+        except:
+            pass
+        
+        # 检查环境变量（accelerate 和其他分布式框架常用）
+        local_rank = os.environ.get('LOCAL_RANK', '0')
+        rank = os.environ.get('RANK', '0')
+        
+        # 只有当 LOCAL_RANK 和 RANK 都为 0 时才是主进程
+        if local_rank != '0' or rank != '0':
+            return False
+        
+        # 如果没有分布式环境，默认为主进程
+        return True
     
     def _init_wandb(self, project_name, experiment_name, log_config):
         """初始化 wandb"""
