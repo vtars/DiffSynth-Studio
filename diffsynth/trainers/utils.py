@@ -497,20 +497,26 @@ class DiffusionTrainingModule(torch.nn.Module):
 class ModelLogger:
     def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x, 
                  use_wandb=False, use_tensorboard=False, project_name="diffsynth-training", 
-                 experiment_name=None, log_config=None):
+                 experiment_name=None, log_config=None, accelerator=None):
         self.output_path = output_path
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
         self.state_dict_converter = state_dict_converter
         self.num_steps = 0
         
-        # 日志记录设置
-        self.use_wandb = use_wandb and WANDB_AVAILABLE
-        self.use_tensorboard = use_tensorboard and TENSORBOARD_AVAILABLE
+        # 只在主进程中启用日志记录
+        self.is_main_process = accelerator is None or accelerator.is_main_process
+        
+        # 日志记录设置（只在主进程中启用）
+        self.use_wandb = use_wandb and WANDB_AVAILABLE and self.is_main_process
+        self.use_tensorboard = use_tensorboard and TENSORBOARD_AVAILABLE and self.is_main_process
         self.wandb_run = None
         self.tensorboard_writer = None
         self.start_time = time.time()
         
-        # 初始化日志记录器
+        # 创建输出目录
+        os.makedirs(output_path, exist_ok=True)
+        
+        # 初始化日志记录器（只在主进程）
         if self.use_wandb:
             self._init_wandb(project_name, experiment_name, log_config)
         
@@ -733,6 +739,28 @@ def launch_training_task(
         gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
     )
+    
+    # 重新初始化 ModelLogger，确保只在主进程中启用日志记录
+    if hasattr(model_logger, 'is_main_process'):
+        # 如果 ModelLogger 已经有 accelerator 信息，跳过
+        pass
+    else:
+        # 更新 ModelLogger 的进程状态
+        model_logger.is_main_process = accelerator.is_main_process
+        model_logger.use_wandb = model_logger.use_wandb and model_logger.is_main_process
+        model_logger.use_tensorboard = model_logger.use_tensorboard and model_logger.is_main_process
+        
+        # 如果不是主进程，关闭已经初始化的日志记录器
+        if not model_logger.is_main_process:
+            if model_logger.tensorboard_writer:
+                model_logger.tensorboard_writer.close()
+                model_logger.tensorboard_writer = None
+            if model_logger.wandb_run:
+                model_logger.wandb_run.finish()
+                model_logger.wandb_run = None
+            model_logger.use_wandb = False
+            model_logger.use_tensorboard = False
+    
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     
     total_steps_per_epoch = len(dataloader)
